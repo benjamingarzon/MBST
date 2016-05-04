@@ -3,35 +3,29 @@ Functions for the MidBrain Segmentation Tool.
 """
 # Author: Benjamin Garzon <benjamin.garzon@gmail.com>
 # License: BSD 3 clause
-
 from __future__ import division
 from subprocess import call
 from nipy import load_image, save_image
-from nipy.core.api import Image
+from nipy.core.api import Image, ImageList
 import os
 import numpy as np
 import pickle
 from collections import defaultdict
 import warnings
+import nibabel as nib
+from nilearn.image import smooth_img
 
-# make sure there are no conflicts between SXX coding and subject names
-#OOP
-# test
-# move to server
-# why the register flag??
-# load parameters from file 
-
-# Define constants - Config file ? 
+import sys
 
 TOL = 1e-4
 MAX_ITERS_EM = 200
 MIN_ITERS_EM = 10
-MAX_ITERS_ICM = 20
-MAX_VOXELS_ICM = 10
+MAX_ITERS_ICM = 50
+MAX_VOXELS_ICM = 1
 
 TWOPI = 2*np.pi
 EPS = 1e-10
-N_NEIGHBOURS = 6
+
 
 SUBJECT_PREFIX = 'MBST_'
 
@@ -81,7 +75,36 @@ def get_neighbours(x):
     neighbours = [(x[0]+i,x[1]+j,x[2]+k) for i in r for j in r for k in r 
         if (i,j,k)!=(0,0,0)
         and abs(i)+abs(j)+abs(k) < 2]
-    return(neighbours)            
+    return(neighbours)         
+      
+
+
+def get_neighbours_2(x):
+    """
+    Get the neighbours of a point given the coordinates (27 points).
+        
+    Parameters
+    ----------
+
+    x : tuple
+        3d coordinates of the center point.
+
+    fname : string
+        File name.
+        
+    Returns
+    ----------
+    
+    neighbours: list
+        List of 3d coordinates of the neighbours.
+    
+    """
+    r = [-1, 0, 1]
+    neighbours = [(x[0]+i,x[1]+j,x[2]+k) for i in r for j in r for k in r 
+        if abs(i)+abs(j)+abs(k) < 2]
+#    neighbours = [x]
+
+    return(neighbours)    
             
 def create_atlas(atlas_file, subjects_dir, sub_dir, subjects, structural_file, 
     structural_brain_file, structural_mask_file, parametric_file, mask_file, 
@@ -208,7 +231,8 @@ def register(target_structural_file, target_structural_brain_file,
         xfm_file = '%s/%s-xfm.mat'%(output_dir, subject)
         warp_file = '%s/%s-warp.nii.gz'%(output_dir, subject)
         fine_warp_file = '%s/%s-fine_warp.nii.gz'%(output_dir, subject)
-        warped_parametric_file = '%s/%s-warped_param.nii.gz'%(output_dir, subject)
+        warped_parametric_file = '%s/%s-warped_param.nii.gz'%(output_dir, \
+	    subject)
         cropped_parametric_file = '%s/%s-cr_param.nii.gz'%(output_dir, subject)
         cropped_target_parametric_file = \
             '%s/%s-cr_target_param.nii.gz'%(output_dir, subject)
@@ -319,7 +343,8 @@ def register(target_structural_file, target_structural_brain_file,
             call(command)
         
             # Put labels back into original space
-            cropped_warped_labels = load_image(cropped_warped_label_file).get_data()
+            cropped_warped_labels = \
+                load_image(cropped_warped_label_file).get_data()
     
             labels = np.zeros(labels.shape)
             labels[firstX:lastX + 1, firstY:lastY + 1, firstZ:lastZ + 1] = \
@@ -365,7 +390,8 @@ def register(target_structural_file, target_structural_brain_file,
                     except OSError:
                         pass                
     
-def fuse_labels(subject_list, output_dir, fused_file, average_mask_file):
+def fuse_labels(subject_list, output_dir, fused_file, average_mask_file, 
+    votes_file):
     """
     Fuses the labels of all the registered instances in the atlas. 
     For each of the instances, correlation between the warped and target 
@@ -387,12 +413,16 @@ def fuse_labels(subject_list, output_dir, fused_file, average_mask_file):
     
     average_mask_file : string 
         File name for the average mask, obtained fusing all the masks.
+
+    votes_file : string 
+        Text file where the votes will be saved.
         
     """
 
     n_subjects = 0
     total_votes = 0
-    votes_f = open(output_dir + '/' + 'votes.txt', 'w')
+#    votes_f = open(output_dir + '/' + 'votes.txt', 'w')
+    votes_f = open(votes_file, 'w')
     
     print('Fusing all registered labels to obtain priors.')
     for subject in subject_list:
@@ -449,6 +479,26 @@ def fuse_labels(subject_list, output_dir, fused_file, average_mask_file):
     write_image(fused_labels, label_image.coordmap, fused_file)    
     write_image(fused_mask, warped_mask_image.coordmap, average_mask_file)   
 
+def smooth_map(input_file, output_file, fwhm):
+    """
+    Returns value of a Gaussian function.
+    
+    Parameters
+    ----------
+
+    input_file : string
+        Input file name.
+    
+    output_file : string
+        Output file name.
+
+    fwhm : float
+	FWHM
+                 
+    """
+    output_image = smooth_img(input_file, fwhm=fwhm) 
+    nib.save(output_image, output_file)
+
 def norm(x, sigma2):
     """
     Returns value of a Gaussian function.
@@ -493,13 +543,16 @@ def expectation_maximization(parametric_matrix, priors_matrix):
 
     n_classes = parametric_matrix.shape[1]
     n_voxels = parametric_matrix.shape[0]
-
-    pis = priors_matrix
     
     iteration = 1
     ratio = 1
     E = -1
     
+    priors_matrix = np.hstack((priors_matrix, priors_matrix, priors_matrix))/3
+    parametric_matrix = np.hstack((parametric_matrix, \
+	parametric_matrix, parametric_matrix))
+    pis = priors_matrix
+
     # Iterate ensuring a min of iterations to avoid local min
     while ((ratio > TOL) or (iteration < MIN_ITERS_EM)) \
         and (iteration < MAX_ITERS_EM):
@@ -515,18 +568,24 @@ def expectation_maximization(parametric_matrix, priors_matrix):
             np.sum(pis, axis=0, keepdims=True)
         
         sigma2_matrix = np.repeat(sigma2, n_voxels, 0)
-        
+     
         if iteration == 1:
         
             # Separate background classes
-            means_matrix[:, -1] = means_matrix[:, -1] - sigma2_matrix[:, -1]
-            means_matrix[:, -2] = means_matrix[:, -2] + sigma2_matrix[:, -2]
-            sigma2_matrix[:, -2:] = .5*sigma2_matrix[:, -2:]
-         
+            means_matrix[:, :n_classes] = \
+                means_matrix[:, :n_classes] \
+                - 2*np.sqrt(sigma2_matrix[:, :n_classes])
+
+            means_matrix[:, n_classes:2*n_classes] = \
+                means_matrix[:, n_classes:2*n_classes] \
+                + 2*np.sqrt(sigma2_matrix[:, n_classes:2*n_classes])
+
+            sigma2_matrix = sigma2_matrix/9
+        
         f = norm((parametric_matrix - means_matrix), sigma2_matrix) \
             * priors_matrix
        
-        pis = f / np.repeat(np.sum(f, axis=1, keepdims=True), n_classes, 1)
+        pis = f / np.repeat(np.sum(f, axis=1, keepdims=True), n_classes*3, 1)
         
         # Update likelihood
         E_old = E
@@ -538,10 +597,13 @@ def expectation_maximization(parametric_matrix, priors_matrix):
 
     print('Expectation-maximization: Iterations: %d, Cost: %f.'%(iteration-1, 
         E))
+
+    pis = pis[:, :n_classes] + pis[:, n_classes:2*n_classes] + \
+        pis[:, 2*n_classes:]
     return(pis)
 
 def estimate_spatial_relations(subject_list, output_dir, spatial_rel_file, 
-    mask_file):
+    priors_file):
     """
     Estimates the probabilities of classes of adjacent voxels from the
     label images warped to the target subject.
@@ -560,16 +622,18 @@ def estimate_spatial_relations(subject_list, output_dir, spatial_rel_file,
     The dict is indexed as: 
     (center coords, neighbour coords, center class, neighbour class):probability 
     
-    mask_file : string 
-        File name for the mask. It should be the same for all the subjects, 
-        since the registered labels are all in the same space (average mask).
+    priors_file : string 
+        File name for the priors.
         
     """
     
-    # Load mask.
-    mask_image = load_image(mask_file)
-    mask = mask_image.get_data()
+    # Load priors
+    priors_image = load_image(priors_file)
+    priors = priors_image.get_data()
+
+    mask = np.sum(priors, 3) > 0
     n_voxels = np.sum(mask > 0)
+    print ("Number of voxels to estimate spatial relations for: %d.\n")%n_voxels
     
     spatial_rel =  defaultdict(float) 
         
@@ -579,7 +643,7 @@ def estimate_spatial_relations(subject_list, output_dir, spatial_rel_file,
     points = set(zip(coords[0], coords[1], coords[2]))
         
     for subject in subject_list:
-        print ("Estimating spatial relations for subject %s")%subject
+        print ("Estimating spatial relations for subject %s.\n")%subject
         
         # Load data
         warped_label_file = '%s/%s-warped_label.nii.gz'%(output_dir, subject)
@@ -603,9 +667,49 @@ def estimate_spatial_relations(subject_list, output_dir, spatial_rel_file,
                     segmentation[point[0], point[1], point[2]], 
                     segmentation[neighbour[0], neighbour[1], neighbour[2]])
                 spatial_rel[index] += 1./n_subjects
-        
+    
+    # Smooth spatial relations
+    spatial_rel_smoothed =  defaultdict(float) 
+    spatial_rel_normalization =  defaultdict(float) 
+
+    print "Smoothing spatial relations.\n"
+    for point in points:
+        neighbours = get_neighbours(point)
+        for neighbour in neighbours:
+	    d = (neighbour[0] - point[0], neighbour[1] - point[1], \
+                neighbour[2] - point[2])
+
+	    for label_point in range(n_classes+1):
+	        for label_neighbour in range(n_classes+1): 
+		    p = np.mean([ spatial_rel[(x, (x[0] + d[0], x[1] + d[1], \
+			x[2] + d[2]), label_point, label_neighbour)] \
+                        for x in get_neighbours_2(point)])
+
+		    spatial_rel_smoothed[(point, neighbour, label_point, \
+                        label_neighbour)] = p
+		    spatial_rel_normalization[(point, neighbour, label_point)] \
+                        += p
+    
+    # Normalize spatial relations
+    print "Normalizing spatial relations.\n"
+    for point in points:
+        neighbours = get_neighbours(point)
+        for neighbour in neighbours:
+	    for label_point in range(n_classes+1):
+	        for label_neighbour in range(n_classes+1): 
+		    p = spatial_rel_normalization[(point, neighbour, \
+                        label_point)]
+
+                    if p > 0:
+	   	        spatial_rel_smoothed[ (point, neighbour, label_point, \
+				label_neighbour) ] /= p
+		    else:
+	   	        spatial_rel_smoothed[ (point, neighbour, label_point, \
+				label_neighbour) ] = -1
+			
+
     with open(spatial_rel_file, 'wb') as fp:
-        pickle.dump(spatial_rel, fp)
+        pickle.dump(spatial_rel_smoothed, fp)
            
 def compute_regularization(points, spatial_rel, segmentation, shape):
     """
@@ -634,30 +738,44 @@ def compute_regularization(points, spatial_rel, segmentation, shape):
     """
 
     n_labels = shape[3]
-    
+
+    # Add background class (index 0)
+    shape = (shape[0], shape[1], shape[2], shape[3] + 1)
+
     # Compute spatial regularization based on spatial relations
     regularization = np.ones(shape)
-    
+    reg_exponent = np.zeros(shape)
+
     print "Computing regularization using spatial relations.\n"
-    for lab_ind in range(n_labels):    
+    for lab_ind in range(n_labels + 1):    
         for point in points:
             neighbours = get_neighbours(point)
             
             for neighbour in neighbours:
-                index = (neighbour, point, lab_ind + 1,
-                    segmentation[point[0], point[1], point[2]])
-                
-                regularization[neighbour[0], neighbour[1], neighbour[2], 
-                lab_ind] *= spatial_rel[index]
-                
-    regularization += EPS                 
+                index = (neighbour, point, 
+			segmentation[neighbour[0], neighbour[1], neighbour[2]], 
+			lab_ind)
+                if spatial_rel[index] >= 0:
+                    regularization[point[0], point[1], point[2], 
+                        lab_ind] *= spatial_rel[index]
+                    reg_exponent[point[0], point[1], point[2], 
+                        lab_ind] += 1
+#		else:
+#                    print "Spatial relation not found: %s"%(index,) 
+ 
+    regularization[reg_exponent>0] = np.power(regularization[reg_exponent>0], 
+        1./reg_exponent[reg_exponent>0])
+    regularization = regularization[:, :, :, 1:]/ \
+	np.repeat(np.sum(regularization, axis=3, keepdims=True) + EPS, n_labels, 
+        axis=3)
+
     return(regularization)
     
 def do_segmentation(parametric_file, priors_file, mask_file, segmentation_file, 
     segmentation4D_file, spatial_rel_file):
     """
     Do the segmentation based on the priors file and expectation maximization 
-    for the probabilities and using .
+    for the probabilities and using regularization.
     
     Parameters
     ----------
@@ -689,7 +807,7 @@ def do_segmentation(parametric_file, priors_file, mask_file, segmentation_file,
     mask_image = load_image(mask_file)
     mask = mask_image.get_data()>0
     parametric = load_image(parametric_file).get_data()[mask]
-    
+
     n_voxels = np.sum(mask>0)
     n_labels = priors.shape[3]
 
@@ -699,7 +817,7 @@ def do_segmentation(parametric_file, priors_file, mask_file, segmentation_file,
     coords = np.where(mask)
     points = set(zip(coords[0], coords[1], coords[2]))
 
-    n_classes = n_labels + 2    
+    n_classes = n_labels + 1 
     parametric_matrix = np.repeat(parametric[:, np.newaxis], n_classes, axis=1)    
 
 
@@ -708,28 +826,27 @@ def do_segmentation(parametric_file, priors_file, mask_file, segmentation_file,
         print ("Segmenting image.")
 
         priors_matrix = np.reshape(priors[mask4D], (n_voxels, n_labels))    
-
-        # Add 2 background classes
-        background = 0.5*(1 - np.sum(priors_matrix, axis=1, keepdims=True))
-        priors_matrix = np.hstack((priors_matrix, background, background))
+	
+        # Add background classes
+        background = (1 - np.sum(priors_matrix, axis=1, keepdims=True))
+        priors_matrix = np.hstack((priors_matrix, background))
 
         # Expectation-maximization    
         pis = expectation_maximization(parametric_matrix, priors_matrix)
 
         # Get segmentation
         posteriors = np.zeros(priors.shape)
-        posteriors[mask4D] = pis[:, :-2].ravel()
+        posteriors[mask4D] = pis[:, :-1].ravel()
     
         max_pis = np.max(pis, axis=1, keepdims=True)
         labels = 1*(pis == np.repeat(max_pis, n_classes, axis=1))
     
         segmentation4D = np.zeros(priors.shape, dtype=np.int8)
-        segmentation4D[mask4D] = labels[:, :-2].ravel().astype(int)
+        segmentation4D[mask4D] = labels[:, :-1].ravel().astype(int)
 
         segmentation = np.zeros(mask.shape, dtype=np.int8)
         for i in range(n_labels):
             segmentation = segmentation + (i+1)*segmentation4D[:, :, :, i]
-
         
     else: 
         # Using regularization
@@ -739,33 +856,32 @@ def do_segmentation(parametric_file, priors_file, mask_file, segmentation_file,
             spatial_rel = pickle.load(fp)
         
         # Iterate between expectation maximization and spatial regularization
-
         segmentation_old = np.zeros(mask.shape, dtype=np.int8)
-        seg_diff = 1
+        seg_diff =  MAX_VOXELS_ICM
     
         iteration = 0
 
-        while (seg_diff <= MAX_VOXELS_ICM and iteration < MAX_ITERS_ICM): 
-            print('Iteration %d'%(iteration))
+        while (seg_diff >= MAX_VOXELS_ICM and iteration < MAX_ITERS_ICM): 
+            print("Iteration %d"%(iteration))
            
             priors_matrix = np.reshape(priors[mask4D], (n_voxels, n_labels))    
 
-            # Add 2 background classes
-            background = 0.5*(1 - np.sum(priors_matrix, axis=1, keepdims=True))
-            priors_matrix = np.hstack((priors_matrix, background, background))
+            # Add background class
+            background = (1 - np.sum(priors_matrix, axis=1, keepdims=True))
+            priors_matrix = np.hstack((priors_matrix, background))
             
             # Expectation-maximization
             pis = expectation_maximization(parametric_matrix, priors_matrix)
 
             # Get posteriors and segmentation
             posteriors = np.zeros(priors.shape)
-            posteriors[mask4D] = pis[:, :-2].ravel()
+            posteriors[mask4D] = pis[:, :-1].ravel()
     
             max_pis = np.max(pis, axis=1, keepdims=True)
             labels = 1*(pis == np.repeat(max_pis, n_classes, axis=1))
     
             segmentation4D = np.zeros(priors.shape, dtype=np.int8)
-            segmentation4D[mask4D] = labels[:, :-2].ravel().astype(int)
+            segmentation4D[mask4D] = labels[:, :-1].ravel().astype(int)
 
             segmentation = np.zeros(mask.shape, dtype=np.int8)
             for i in range(n_labels):
@@ -775,24 +891,33 @@ def do_segmentation(parametric_file, priors_file, mask_file, segmentation_file,
             regularization = compute_regularization(points, spatial_rel, 
                 segmentation, priors.shape)
 
-            # Modify priors with the regularization
-            priors = orig_priors*regularization
-            # ALTERNATIVE: priors = posteriors*regularization
-            priors = priors/np.repeat(np.sum(regularization, axis=3, 
-                keepdims=True), n_labels, axis=3)
+	    regularization = np.concatenate((1 - np.sum(regularization, axis=3, 
+		keepdims=True), regularization), axis=3)
+	    posteriors = np.concatenate((1 - np.sum(posteriors, axis=3, 
+		keepdims=True), posteriors), axis=3)
+            priors = posteriors * regularization
+	    priors = priors[:, :, :, 1:]/ \
+	        np.repeat(np.sum(priors, axis=3, keepdims=True) + EPS, n_labels, 
+                axis=3)
+            
+	    seg_diff = np.sum(np.abs(segmentation_old - segmentation)>0)
+
+            print("%d voxels changed."%(seg_diff))
 
             segmentation_old = segmentation   
-        
-            iteration += 1 
-                
+            iteration += 1    
+            
+    # Remove spatial relations
+    try:
+        os.remove(spatial_rel_file)
+    except OSError:
+        pass 
+
     # Write out the results
     write_image(segmentation, mask_image.coordmap, segmentation_file)  
     write_image(segmentation4D, priors_image.coordmap, segmentation4D_file)
 
-#    write_image(regularization, priors_image.coordmap, regularization_file)
-#    write_image(posteriors, priors_image.coordmap, posteriors_file)
-
-
+    
 def compute_scores(segmentation_file, target_label_file, score_names):
     """
     Computes summary scores to evaluate the segmentations.

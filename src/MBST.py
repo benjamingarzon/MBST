@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 """
 usage: MBST.py [-h] [-c] [-o] tg_struct tg_brain tg_param atlas output
 
@@ -21,13 +21,17 @@ optional arguments:
 # Author: Benjamin Garzon <benjamin.garzon@gmail.com>
 # License: BSD 3 clause
 
+import time
 import sys
 import argparse
 from segment import register, estimate_spatial_relations, do_segmentation, \
-fuse_labels
+fuse_labels, smooth_map
+
+FWHM_VAL = 2.0
 
 def MBST(args):
 
+    initial_time = time.clock()
     target_structural_file = args.tg_struct
     target_structural_brain_file = args.tg_brain
     target_parametric_file = args.tg_param
@@ -36,9 +40,15 @@ def MBST(args):
     clean_up = args.c
     overwrite = args.o
 
-    priors_file = '%s/priors.nii.gz'%(output_dir)    
-    average_mask_file = '%s/average_mask.nii.gz'%(output_dir)
+    priors_file = '%s/priors.nii.gz'%(output_dir)
+    priors_smoothed_file = '%s/priors_smoothed.nii.gz'%(output_dir)
     
+    average_mask_file = '%s/average_mask.nii.gz'%(output_dir)
+    spatial_rel_file = '%s/spatial_rel.pkl'%(output_dir)
+    segmentation_file = '%s/segmentation.nii.gz'%(output_dir)
+    segmentation4D_file = '%s/segmentation4D.nii.gz'%(output_dir)
+    votes_file = '%s/votes.txt'%(output_dir)
+
     atlas_subjects = list()
     f_atlas = open(atlas_file, 'r')    
     for line in f_atlas:
@@ -47,18 +57,31 @@ def MBST(args):
             label_file = line.replace('\n', '').split(':')
         atlas_subjects.append(subject)
     f_atlas.close()
-    
+
+    print time.clock() - initial_time
     register(target_structural_file, target_structural_brain_file, 
         target_parametric_file, atlas_file, output_dir, clean_up, overwrite)
-    
-    fuse_labels(atlas_subjects, output_dir, priors_file, average_mask_file)
-            
+
+    print time.clock() - initial_time
+    fuse_labels(atlas_subjects, output_dir, priors_file, average_mask_file,
+        votes_file)
+
+    print time.clock() - initial_time
+    smooth_map(priors_file, priors_smoothed_file, FWHM_VAL)
+
+    print time.clock() - initial_time
     estimate_spatial_relations(atlas_subjects, output_dir, spatial_rel_file, 
-        average_mask_file)        
-            
-    do_segmentation(atlas_subjects, priors_file, average_mask_file, 
-        segmentation_file, segmentation4D_file, spatial_rel_file)
-        
+        priors_smoothed_file)        
+
+    print time.clock() - initial_time
+    do_segmentation(target_parametric_file, priors_smoothed_file, average_mask_file, 
+        segmentation_file, segmentation4D_file, spatial_rel_file)            
+      
+    final_time = time.clock()
+  
+    print "Segmentation with %d training subjects finished in %f seconds."\
+	%(len(atlas_subjects), final_time - initial_time)
+
 def main():
 
     parser = argparse.ArgumentParser(description='MidBrain Segmentation Tool: \
